@@ -4,6 +4,9 @@ Investor Insights: How Legends Would Invest Today
 A Streamlit app that simulates how famous investors would invest today
 based on their real historical strategies, using real financial data.
 
+Users pick investors, weight them, enter a budget, and get a suggested
+portfolio allocation with dollar amounts and share counts.
+
 DISCLAIMER: This is for educational/simulation purposes only.
             Not financial advice. Consult professionals for investments.
 """
@@ -13,7 +16,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import altair as alt
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, Any
 
 # ---------------------------------------------------------------------------
 # Preset ticker lists
@@ -103,6 +106,8 @@ INVESTOR_BIOS: Dict[str, str] = {
     ),
 }
 
+INVESTOR_NAMES = list(INVESTOR_BIOS.keys())
+
 # ---------------------------------------------------------------------------
 # Helper: safely read a metric from yfinance info dict
 # ---------------------------------------------------------------------------
@@ -121,12 +126,11 @@ def _get(info: Dict[str, Any], key: str, default=None):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_stock_data(ticker: str) -> Dict[str, Any]:
-    """Fetch stock info and history from yfinance. Returns a dict with
-    'info' and 'history' keys, or an 'error' key on failure."""
+    """Fetch stock info and 1-year history from yfinance."""
     try:
         t = yf.Ticker(ticker)
         info = t.info
-        if not info or info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
+        if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
             return {"error": f"No data found for ticker '{ticker}'."}
         hist = t.history(period="1y")
         return {"info": info, "history": hist}
@@ -135,31 +139,22 @@ def fetch_stock_data(ticker: str) -> Dict[str, Any]:
 
 
 def get_price(info: Dict) -> float:
-    """Best-effort current price."""
     return _get(info, "currentPrice") or _get(info, "regularMarketPrice") or _get(info, "previousClose", 0.0)
 
 
 def compute_extras(info: Dict, hist: pd.DataFrame) -> Dict[str, Any]:
-    """Derive additional metrics not always directly in info."""
+    """Derive additional metrics not directly in info."""
     extras: Dict[str, Any] = {}
-
-    # 52-week change
     if not hist.empty:
         first = hist["Close"].iloc[0]
         last = hist["Close"].iloc[-1]
-        if first and first > 0:
-            extras["52w_change"] = (last - first) / first * 100
-        hi = hist["Close"].max()
-        lo = hist["Close"].min()
-        if hi and hi > 0:
-            extras["52w_range_pct"] = (hi - lo) / hi * 100
+        extras["52w_change"] = (last - first) / first * 100 if first and first > 0 else None
+        hi, lo = hist["Close"].max(), hist["Close"].min()
+        extras["52w_range_pct"] = (hi - lo) / hi * 100 if hi and hi > 0 else None
         extras["avg_volume"] = hist["Volume"].mean()
     else:
-        extras["52w_change"] = None
-        extras["52w_range_pct"] = None
-        extras["avg_volume"] = None
+        extras["52w_change"] = extras["52w_range_pct"] = extras["avg_volume"] = None
 
-    # PEG ratio – use yfinance value or compute
     peg = _get(info, "pegRatio")
     if peg is None:
         pe = _get(info, "trailingPE")
@@ -168,21 +163,17 @@ def compute_extras(info: Dict, hist: pd.DataFrame) -> Dict[str, Any]:
             peg = pe / (growth * 100)
     extras["pegRatio"] = peg
 
-    # Sector tag (lowercase for matching)
     sector = _get(info, "sector", "")
     extras["sector_lower"] = sector.lower() if sector else ""
-
     return extras
 
 
 # ---------------------------------------------------------------------------
-# Strategy scoring functions
-# Each returns (score: int 0-100, explanation: str)
+# Strategy scoring functions — each returns (score 0-100, explanation)
 # ---------------------------------------------------------------------------
 
 def score_buffett(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     pe = _get(info, "trailingPE")
     roe = _get(info, "returnOnEquity")
     dte = _get(info, "debtToEquity")
@@ -191,27 +182,20 @@ def score_buffett(info: Dict, extras: Dict) -> Tuple[int, str]:
     fwd_eps = _get(info, "forwardEps")
 
     if pe is not None and pe < 15:
-        score += 30
-        reasons.append(f"Low P/E ({pe:.1f} < 15)")
+        score += 30; reasons.append(f"Low P/E ({pe:.1f})")
     if roe is not None and roe > 0.15:
-        score += 20
-        reasons.append(f"High ROE ({roe*100:.1f}% > 15%)")
-    if dte is not None and dte < 50:  # yfinance often reports as %
-        score += 20
-        reasons.append(f"Low debt-to-equity ({dte:.1f})")
+        score += 20; reasons.append(f"High ROE ({roe*100:.1f}%)")
+    if dte is not None and dte < 50:
+        score += 20; reasons.append(f"Low D/E ({dte:.1f})")
     if fcf is not None and fcf > 0:
-        score += 15
-        reasons.append("Positive free cash flow")
-    if trail_eps is not None and fwd_eps is not None and trail_eps > 0 and fwd_eps > trail_eps:
-        score += 15
-        reasons.append("Earnings growth (forward EPS > trailing)")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Low match on value metrics."
+        score += 15; reasons.append("Positive FCF")
+    if trail_eps and fwd_eps and trail_eps > 0 and fwd_eps > trail_eps:
+        score += 15; reasons.append("Growing EPS")
+    return min(score, 100), "; ".join(reasons) or "Low match on value metrics."
 
 
 def score_lynch(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     peg = extras.get("pegRatio")
     pe = _get(info, "trailingPE")
     eg = _get(info, "earningsGrowth")
@@ -219,146 +203,106 @@ def score_lynch(info: Dict, extras: Dict) -> Tuple[int, str]:
     insider = _get(info, "heldPercentInsiders")
 
     if peg is not None and peg < 1:
-        score += 30
-        reasons.append(f"PEG < 1 ({peg:.2f})")
+        score += 30; reasons.append(f"PEG < 1 ({peg:.2f})")
     if eg is not None and eg > 0.15:
-        score += 20
-        reasons.append(f"Earnings growth {eg*100:.1f}% > 15%")
+        score += 20; reasons.append(f"Earnings growth {eg*100:.1f}%")
     if pe is not None and 10 <= pe <= 20:
-        score += 20
-        reasons.append(f"Reasonable P/E ({pe:.1f})")
+        score += 20; reasons.append(f"Reasonable P/E ({pe:.1f})")
     if insider is not None and insider > 0.10:
-        score += 15
-        reasons.append(f"High insider ownership ({insider*100:.1f}%)")
+        score += 15; reasons.append(f"Insider own {insider*100:.1f}%")
     if rg is not None and rg > 0.10:
-        score += 15
-        reasons.append(f"Strong sales growth ({rg*100:.1f}%)")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited GARP indicators."
+        score += 15; reasons.append(f"Sales growth {rg*100:.1f}%")
+    return min(score, 100), "; ".join(reasons) or "Limited GARP indicators."
 
 
 def score_dalio(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     beta = _get(info, "beta")
-    div_yield = _get(info, "dividendYield")
+    dy = _get(info, "dividendYield")
     cr = _get(info, "currentRatio")
+    sector = extras.get("sector_lower", "")
 
     if beta is not None and beta < 1:
-        score += 30
-        reasons.append(f"Low beta ({beta:.2f} < 1)")
-    if div_yield is not None and div_yield > 0.02:
-        score += 20
-        reasons.append(f"Dividend yield {div_yield*100:.1f}% > 2%")
+        score += 30; reasons.append(f"Low beta ({beta:.2f})")
+    if dy is not None and dy > 0.02:
+        score += 20; reasons.append(f"Div yield {dy*100:.1f}%")
     if cr is not None and cr > 2:
-        score += 20
-        reasons.append(f"Strong current ratio ({cr:.1f} > 2)")
-    # Sector resilience proxy
-    sector = extras.get("sector_lower", "")
-    resilient = ["consumer defensive", "utilities", "healthcare", "industrials"]
-    if any(r in sector for r in resilient):
-        score += 15
-        reasons.append(f"Resilient sector ({_get(info, 'sector', 'N/A')})")
+        score += 20; reasons.append(f"Current ratio {cr:.1f}")
+    if any(r in sector for r in ["consumer defensive", "utilities", "healthcare", "industrials"]):
+        score += 15; reasons.append(f"Resilient sector")
     if beta is not None and beta < 0.8:
-        score += 15
-        reasons.append("Very low market correlation")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited all-weather indicators."
+        score += 15; reasons.append("Very low correlation")
+    return min(score, 100), "; ".join(reasons) or "Limited all-weather indicators."
 
 
 def score_lundberg(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     pb = _get(info, "priceToBook")
     roa = _get(info, "returnOnAssets")
     payout = _get(info, "payoutRatio")
     margin = _get(info, "profitMargins")
-    range_pct = extras.get("52w_range_pct")
+    rng = extras.get("52w_range_pct")
 
     if pb is not None and pb < 1.5:
-        score += 30
-        reasons.append(f"Low P/B ({pb:.2f} < 1.5)")
+        score += 30; reasons.append(f"Low P/B ({pb:.2f})")
     if roa is not None and roa > 0.08:
-        score += 20
-        reasons.append(f"High ROA ({roa*100:.1f}% > 8%)")
+        score += 20; reasons.append(f"ROA {roa*100:.1f}%")
     if payout is not None and payout > 0.30:
-        score += 20
-        reasons.append(f"Stable dividend payout ({payout*100:.0f}% > 30%)")
-    if range_pct is not None and range_pct < 50:
-        score += 15
-        reasons.append(f"Low 52w volatility ({range_pct:.0f}% range)")
+        score += 20; reasons.append(f"Payout {payout*100:.0f}%")
+    if rng is not None and rng < 50:
+        score += 15; reasons.append(f"Low volatility ({rng:.0f}%)")
     if margin is not None and margin > 0.10:
-        score += 15
-        reasons.append(f"Net income margin {margin*100:.1f}% > 10%")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited conservative value signals."
+        score += 15; reasons.append(f"Margin {margin*100:.1f}%")
+    return min(score, 100), "; ".join(reasons) or "Limited conservative value signals."
 
 
 def score_gardell(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     target = _get(info, "targetMeanPrice")
     price = get_price(info)
     roe = _get(info, "returnOnEquity")
-    assets = _get(info, "totalAssets") or _get(info, "totalAssets")
+    assets = _get(info, "totalAssets")
     eg = _get(info, "earningsGrowth")
-    float_pct = _get(info, "floatShares")
-    shares_out = _get(info, "sharesOutstanding")
+    float_s = _get(info, "floatShares")
+    shares = _get(info, "sharesOutstanding")
     ret52 = extras.get("52w_change")
 
     if target and price and price > 0 and (target - price) / price > 0.20:
-        score += 30
-        upside = (target - price) / price * 100
-        reasons.append(f"Analyst upside {upside:.0f}% > 20%")
+        score += 30; reasons.append(f"Analyst upside {(target-price)/price*100:.0f}%")
     if ret52 is not None and ret52 < 0:
-        score += 20
-        reasons.append(f"Underperforming 52w ({ret52:.1f}%)")
-    if float_pct and shares_out and shares_out > 0:
-        ff = float_pct / shares_out
-        if ff > 0.50:
-            score += 20
-            reasons.append(f"High free float ({ff*100:.0f}%)")
+        score += 20; reasons.append(f"Underperforming ({ret52:.1f}%)")
+    if float_s and shares and shares > 0 and float_s / shares > 0.50:
+        score += 20; reasons.append("High free float")
     if roe is not None and roe < 0.10 and assets and assets > 0:
-        score += 15
-        reasons.append("Low ROE with significant assets (governance weakness)")
+        score += 15; reasons.append("Weak governance proxy")
     if eg is not None and eg < 0:
-        score += 15
-        reasons.append("Negative earnings growth – turnaround potential")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited activist signals."
+        score += 15; reasons.append("Turnaround potential")
+    return min(score, 100), "; ".join(reasons) or "Limited activist signals."
 
 
 def score_jacob_wallenberg(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     roe = _get(info, "returnOnEquity")
     dte = _get(info, "debtToEquity")
-    div_yield = _get(info, "dividendYield")
+    dy = _get(info, "dividendYield")
     eg = _get(info, "earningsGrowth")
     beta = _get(info, "beta")
 
     if roe is not None and roe > 0.12:
-        score += 25
-        reasons.append(f"ROE {roe*100:.1f}% > 12%")
+        score += 25; reasons.append(f"ROE {roe*100:.1f}%")
     if dte is not None and dte < 100:
-        score += 20
-        reasons.append(f"Low debt-to-equity ({dte:.1f})")
-    if div_yield is not None and div_yield > 0.015:
-        score += 20
-        reasons.append(f"Dividend yield {div_yield*100:.1f}% > 1.5%")
+        score += 20; reasons.append(f"Low D/E ({dte:.1f})")
+    if dy is not None and dy > 0.015:
+        score += 20; reasons.append(f"Div yield {dy*100:.1f}%")
     if eg is not None and eg > 0.10:
-        score += 20
-        reasons.append(f"Earnings growth {eg*100:.1f}% > 10%")
+        score += 20; reasons.append(f"Earnings growth {eg*100:.1f}%")
     if beta is not None and beta < 1.2:
-        score += 15
-        reasons.append(f"Low volatility (beta {beta:.2f})")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited long-term stability signals."
+        score += 15; reasons.append(f"Low beta ({beta:.2f})")
+    return min(score, 100), "; ".join(reasons) or "Limited stability signals."
 
 
 def score_schorling(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     margin = _get(info, "profitMargins")
     rg = _get(info, "revenueGrowth")
     roa = _get(info, "returnOnAssets")
@@ -366,27 +310,20 @@ def score_schorling(info: Dict, extras: Dict) -> Tuple[int, str]:
     fcf = _get(info, "freeCashflow")
 
     if margin is not None and margin > 0.15:
-        score += 25
-        reasons.append(f"High profit margin ({margin*100:.1f}% > 15%)")
+        score += 25; reasons.append(f"Margin {margin*100:.1f}%")
     if rg is not None and rg > 0.10:
-        score += 25
-        reasons.append(f"Strong sales growth ({rg*100:.1f}% > 10%)")
+        score += 25; reasons.append(f"Sales growth {rg*100:.1f}%")
     if roa is not None and roa > 0.10:
-        score += 20
-        reasons.append(f"High ROA ({roa*100:.1f}% > 10%)")
+        score += 20; reasons.append(f"ROA {roa*100:.1f}%")
     if mcap is not None and mcap > 1e10:
-        score += 15
-        reasons.append("Large market cap – market leader proxy")
+        score += 15; reasons.append("Market leader")
     if fcf is not None and fcf > 0:
-        score += 15
-        reasons.append("Positive free cash flow")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited specialist-leader signals."
+        score += 15; reasons.append("Positive FCF")
+    return min(score, 100), "; ".join(reasons) or "Limited specialist-leader signals."
 
 
 def score_bennet(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     pb = _get(info, "priceToBook")
     roe = _get(info, "returnOnEquity")
     payout = _get(info, "payoutRatio")
@@ -394,27 +331,20 @@ def score_bennet(info: Dict, extras: Dict) -> Tuple[int, str]:
     dte = _get(info, "debtToEquity")
 
     if pb is not None and pb < 2:
-        score += 25
-        reasons.append(f"Low P/B ({pb:.2f} < 2)")
+        score += 25; reasons.append(f"P/B {pb:.2f}")
     if roe is not None and roe > 0.10:
-        score += 20
-        reasons.append(f"ROE {roe*100:.1f}% > 10%")
+        score += 20; reasons.append(f"ROE {roe*100:.1f}%")
     if payout is not None and payout > 0.25:
-        score += 20
-        reasons.append(f"Stable payout ({payout*100:.0f}% > 25%)")
+        score += 20; reasons.append(f"Payout {payout*100:.0f}%")
     if margin is not None and margin > 0.08:
-        score += 20
-        reasons.append(f"Net margin {margin*100:.1f}% > 8%")
+        score += 20; reasons.append(f"Margin {margin*100:.1f}%")
     if dte is not None and dte < 80:
-        score += 15
-        reasons.append(f"Low debt ({dte:.1f} D/E)")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited sustainable-value signals."
+        score += 15; reasons.append(f"Low debt ({dte:.1f})")
+    return min(score, 100), "; ".join(reasons) or "Limited sustainable-value signals."
 
 
 def score_soros(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     beta = _get(info, "beta")
     pe = _get(info, "trailingPE")
     ret52 = extras.get("52w_change")
@@ -422,28 +352,21 @@ def score_soros(info: Dict, extras: Dict) -> Tuple[int, str]:
     avg_vol = extras.get("avg_volume")
 
     if beta is not None and beta > 1.2:
-        score += 25
-        reasons.append(f"High beta ({beta:.2f} > 1.2)")
+        score += 25; reasons.append(f"High beta ({beta:.2f})")
     if ret52 is not None and ret52 > 20:
-        score += 25
-        reasons.append(f"Strong momentum ({ret52:.0f}% 52w change)")
+        score += 25; reasons.append(f"Momentum ({ret52:.0f}%)")
     if vol and avg_vol and avg_vol > 0 and vol > avg_vol:
-        score += 20
-        reasons.append("Volume above average")
+        score += 20; reasons.append("High volume")
     if pe is not None and (pe > 25 or pe < 10):
-        score += 15
-        reasons.append(f"Reflexivity signal (P/E {pe:.1f})")
+        score += 15; reasons.append(f"Reflexivity (P/E {pe:.1f})")
     sector = extras.get("sector_lower", "")
     if any(s in sector for s in ["energy", "financial", "basic materials"]):
-        score += 15
-        reasons.append(f"Macro-sensitive sector ({_get(info, 'sector', 'N/A')})")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited speculative macro signals."
+        score += 15; reasons.append("Macro-sensitive sector")
+    return min(score, 100), "; ".join(reasons) or "Limited macro signals."
 
 
 def score_icahn(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     pe = _get(info, "trailingPE")
     pb = _get(info, "priceToBook")
     cash = _get(info, "totalCash")
@@ -453,27 +376,20 @@ def score_icahn(info: Dict, extras: Dict) -> Tuple[int, str]:
     assets = _get(info, "totalAssets")
 
     if pe is not None and pe < 12:
-        score += 30
-        reasons.append(f"Low P/E ({pe:.1f} < 12)")
+        score += 30; reasons.append(f"Low P/E ({pe:.1f})")
     if pb is not None and pb < 1:
-        score += 25
-        reasons.append(f"Low P/B ({pb:.2f} < 1)")
+        score += 25; reasons.append(f"Low P/B ({pb:.2f})")
     if cash and mcap and mcap > 0 and (cash / mcap) > 0.10:
-        score += 20
-        reasons.append(f"High cash ({cash/mcap*100:.0f}% of market cap)")
+        score += 20; reasons.append(f"Cash rich ({cash/mcap*100:.0f}%)")
     if ret52 is not None and ret52 < 0:
-        score += 15
-        reasons.append(f"Underperforming ({ret52:.1f}% 52w)")
+        score += 15; reasons.append(f"Underperforming ({ret52:.1f}%)")
     if roe is not None and roe < 0.10 and assets and assets > 0:
-        score += 10
-        reasons.append("Low ROE with assets – activist potential")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited contrarian signals."
+        score += 10; reasons.append("Activist potential")
+    return min(score, 100), "; ".join(reasons) or "Limited contrarian signals."
 
 
 def score_marcus_wallenberg(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     eg = _get(info, "earningsGrowth")
     cr = _get(info, "currentRatio")
     dte = _get(info, "debtToEquity")
@@ -481,27 +397,20 @@ def score_marcus_wallenberg(info: Dict, extras: Dict) -> Tuple[int, str]:
     sector = extras.get("sector_lower", "")
 
     if eg is not None and eg > 0.12:
-        score += 25
-        reasons.append(f"Earnings growth {eg*100:.1f}% > 12%")
+        score += 25; reasons.append(f"Earnings growth {eg*100:.1f}%")
     if cr is not None and cr > 1.5:
-        score += 20
-        reasons.append(f"Strong balance sheet (CR {cr:.1f})")
+        score += 20; reasons.append(f"Current ratio {cr:.1f}")
     if dte is not None and dte < 80:
-        score += 20
-        reasons.append(f"Low debt ({dte:.1f} D/E)")
+        score += 20; reasons.append(f"Low debt ({dte:.1f})")
     if any(s in sector for s in ["technology", "healthcare"]):
-        score += 20
-        reasons.append(f"Innovation sector ({_get(info, 'sector', 'N/A')})")
+        score += 20; reasons.append("Innovation sector")
     if beta is not None and beta < 1:
-        score += 15
-        reasons.append(f"Low volatility (beta {beta:.2f})")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited stewardship signals."
+        score += 15; reasons.append(f"Low beta ({beta:.2f})")
+    return min(score, 100), "; ".join(reasons) or "Limited stewardship signals."
 
 
 def score_cathie_wood(info: Dict, extras: Dict) -> Tuple[int, str]:
-    score = 0
-    reasons = []
+    score, reasons = 0, []
     rg = _get(info, "revenueGrowth")
     fwd_pe = _get(info, "forwardPE")
     beta = _get(info, "beta")
@@ -509,27 +418,19 @@ def score_cathie_wood(info: Dict, extras: Dict) -> Tuple[int, str]:
     sector = extras.get("sector_lower", "")
 
     if rg is not None and rg > 0.20:
-        score += 30
-        reasons.append(f"Revenue growth {rg*100:.1f}% > 20%")
+        score += 30; reasons.append(f"Revenue growth {rg*100:.1f}%")
     if fwd_pe is not None and fwd_pe > 30:
-        score += 20
-        reasons.append(f"High forward P/E ({fwd_pe:.1f}) – growth priced in")
-    disruptive = ["technology", "healthcare", "communication", "financial services"]
-    if any(d in sector for d in disruptive):
-        score += 20
-        reasons.append(f"Disruptive sector ({_get(info, 'sector', 'N/A')})")
+        score += 20; reasons.append(f"High fwd P/E ({fwd_pe:.1f})")
+    if any(d in sector for d in ["technology", "healthcare", "communication", "financial services"]):
+        score += 20; reasons.append("Disruptive sector")
     if beta is not None and beta > 1.5:
-        score += 15
-        reasons.append(f"High beta ({beta:.2f})")
+        score += 15; reasons.append(f"High beta ({beta:.2f})")
     if ret52 is not None and ret52 > 15:
-        score += 15
-        reasons.append(f"Positive momentum ({ret52:.0f}% 52w)")
-
-    return min(score, 100), "; ".join(reasons) if reasons else "Limited disruptive-innovation signals."
+        score += 15; reasons.append(f"Momentum ({ret52:.0f}%)")
+    return min(score, 100), "; ".join(reasons) or "Limited disruptive signals."
 
 
-# Mapping investor names to scoring functions
-INVESTOR_STRATEGIES: Dict[str, Any] = {
+INVESTOR_STRATEGIES = {
     "Warren Buffett": score_buffett,
     "Peter Lynch": score_lynch,
     "Ray Dalio": score_dalio,
@@ -544,15 +445,13 @@ INVESTOR_STRATEGIES: Dict[str, Any] = {
     "Cathie Wood": score_cathie_wood,
 }
 
-INVESTOR_NAMES = list(INVESTOR_STRATEGIES.keys())
-
 
 # ---------------------------------------------------------------------------
 # Analysis pipeline
 # ---------------------------------------------------------------------------
 
 def analyse_stock(ticker: str) -> Dict[str, Any]:
-    """Fetch data and run all investor strategies for one ticker."""
+    """Fetch data and score against all investor strategies."""
     data = fetch_stock_data(ticker)
     if "error" in data:
         return {"ticker": ticker, "error": data["error"]}
@@ -579,8 +478,7 @@ def analyse_stock(ticker: str) -> Dict[str, Any]:
         "Sector": _get(info, "sector", "N/A"),
     }
 
-    scores = {}
-    explanations = {}
+    scores, explanations = {}, {}
     for name, func in INVESTOR_STRATEGIES.items():
         s, e = func(info, extras)
         scores[name] = s
@@ -591,8 +489,59 @@ def analyse_stock(ticker: str) -> Dict[str, Any]:
     return result
 
 
-def format_metric(val, pct=False):
-    """Format a metric for display."""
+def compute_portfolio(results, weights: Dict[str, float], budget: float):
+    """
+    Given analysed stocks, investor weights, and a dollar budget,
+    compute a weighted composite score for each stock, then allocate
+    the budget proportionally.
+
+    Returns a DataFrame with allocation details.
+    """
+    valid = [r for r in results if "error" not in r]
+    if not valid:
+        return pd.DataFrame()
+
+    # Normalise weights so they sum to 1
+    total_w = sum(weights.values())
+    if total_w == 0:
+        return pd.DataFrame()
+    norm = {k: v / total_w for k, v in weights.items()}
+
+    rows = []
+    for r in valid:
+        composite = sum(r["scores"].get(inv, 0) * w for inv, w in norm.items())
+        rows.append({
+            "Ticker": r["ticker"],
+            "Name": r["name"],
+            "Price": r["price"],
+            "Currency": r["currency"],
+            "Composite Score": round(composite, 1),
+            "scores": r["scores"],
+            "explanations": r["explanations"],
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Allocate budget proportionally to composite score
+    total_score = df["Composite Score"].sum()
+    if total_score == 0:
+        df["Allocation %"] = 0.0
+        df["Amount"] = 0.0
+        df["Shares"] = 0
+    else:
+        df["Allocation %"] = (df["Composite Score"] / total_score * 100).round(1)
+        df["Amount"] = (df["Composite Score"] / total_score * budget).round(2)
+        df["Shares"] = df.apply(
+            lambda row: int(row["Amount"] // row["Price"]) if row["Price"] > 0 else 0,
+            axis=1,
+        )
+        df["Leftover"] = (df["Amount"] - df["Shares"] * df["Price"]).round(2)
+
+    df = df.sort_values("Composite Score", ascending=False).reset_index(drop=True)
+    return df
+
+
+def fmt(val, pct=False):
     if val is None:
         return "N/A"
     if pct:
@@ -607,26 +556,59 @@ def format_metric(val, pct=False):
 # ---------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(
-        page_title="Investor Insights",
-        page_icon="📊",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Investor Insights", page_icon="📊", layout="wide")
 
     st.title("Investor Insights: How Legends Would Invest Today")
     st.markdown(
-        "Analyse stocks through the lens of **12 famous investors** using "
-        "**real financial data**. Enter tickers below or pick a preset."
+        "Pick your favourite investors, set their influence, enter your budget, "
+        "and get a **suggested portfolio allocation** based on real data."
     )
 
-    # ---- Sidebar: Investor Bios ----
+    # ================================================================
+    # SIDEBAR — Investor weights + bios
+    # ================================================================
     with st.sidebar:
-        st.header("Investor Profiles")
-        for name, bio in INVESTOR_BIOS.items():
-            with st.expander(name):
-                st.write(bio)
+        st.header("1. Pick & Weight Investors")
+        st.caption(
+            "Use sliders to set how much influence each investor's strategy "
+            "has on your portfolio. Set to 0 to exclude."
+        )
 
-    # ---- Ticker input ----
+        weights: Dict[str, float] = {}
+        for inv_name in INVESTOR_NAMES:
+            with st.expander(inv_name, expanded=False):
+                st.caption(INVESTOR_BIOS[inv_name])
+                weights[inv_name] = st.slider(
+                    f"Weight", 0, 100, 0,
+                    key=f"w_{inv_name}",
+                    help=f"How much should {inv_name}'s strategy influence your portfolio?",
+                )
+
+        st.divider()
+        st.header("2. Investment Budget")
+        budget = st.number_input(
+            "Amount to invest ($)", min_value=0.0, value=10000.0, step=500.0,
+            help="Enter the total amount you want to invest.",
+        )
+
+        # Quick-pick presets
+        st.divider()
+        st.subheader("Quick Presets")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("All Equal"):
+                for inv_name in INVESTOR_NAMES:
+                    st.session_state[f"w_{inv_name}"] = 50
+                st.rerun()
+        with col_b:
+            if st.button("Reset to 0"):
+                for inv_name in INVESTOR_NAMES:
+                    st.session_state[f"w_{inv_name}"] = 0
+                st.rerun()
+
+    # ================================================================
+    # MAIN AREA — Ticker input + results
+    # ================================================================
     col1, col2 = st.columns([3, 1])
     with col1:
         ticker_input = st.text_input(
@@ -648,62 +630,126 @@ def main():
         st.warning("Please enter at least one ticker.")
         st.stop()
 
-    st.write(f"**Tickers to analyse:** {', '.join(tickers)}")
+    # Check at least one investor is weighted
+    active_investors = {k: v for k, v in weights.items() if v > 0}
 
-    # ---- Analyse button ----
-    if st.button("Analyse Stocks", type="primary"):
+    st.write(f"**Tickers:** {', '.join(tickers)}")
+    if active_investors:
+        inv_summary = ", ".join(f"{k} ({v}%)" for k, v in active_investors.items())
+        st.write(f"**Active investors:** {inv_summary}")
+        st.write(f"**Budget:** ${budget:,.2f}")
+    else:
+        st.info("Set at least one investor weight in the sidebar to get portfolio suggestions.")
+
+    # ---- Analyse ----
+    if st.button("Analyse & Build Portfolio", type="primary"):
         results = []
         progress = st.progress(0, text="Fetching data...")
         for i, ticker in enumerate(tickers):
-            progress.progress((i) / len(tickers), text=f"Analysing {ticker}...")
-            res = analyse_stock(ticker)
-            results.append(res)
+            progress.progress(i / len(tickers), text=f"Analysing {ticker}...")
+            results.append(analyse_stock(ticker))
         progress.progress(1.0, text="Done!")
-
-        # Store in session state so results survive reruns
         st.session_state["results"] = results
 
-    # ---- Display results ----
     if "results" not in st.session_state:
-        st.info("Click **Analyse Stocks** to start.")
+        st.info("Click **Analyse & Build Portfolio** to start.")
         st.stop()
 
     results = st.session_state["results"]
-
-    # Separate errors
     errors = [r for r in results if "error" in r]
     valid = [r for r in results if "error" not in r]
-
-    if errors:
-        for e in errors:
-            st.error(f"**{e['ticker']}**: {e['error']}")
-
+    for e in errors:
+        st.error(f"**{e['ticker']}**: {e['error']}")
     if not valid:
         st.stop()
 
-    # ---- Key Metrics Table ----
-    st.subheader("Key Metrics")
+    # ================================================================
+    # PORTFOLIO ALLOCATION (the main new feature)
+    # ================================================================
+    if active_investors and budget > 0:
+        st.header("Suggested Portfolio Allocation")
+
+        portfolio_df = compute_portfolio(results, active_investors, budget)
+
+        if portfolio_df.empty:
+            st.warning("Could not compute portfolio. Check investor weights.")
+        else:
+            # Summary cards
+            cols = st.columns(len(portfolio_df) if len(portfolio_df) <= 5 else 5)
+            for i, (_, row) in enumerate(portfolio_df.head(5).iterrows()):
+                with cols[i]:
+                    st.metric(
+                        label=row["Ticker"],
+                        value=f"${row['Amount']:,.2f}",
+                        delta=f"{row['Allocation %']}% | {row['Shares']} shares",
+                    )
+
+            # Full table
+            display_df = portfolio_df[["Ticker", "Name", "Composite Score", "Allocation %",
+                                       "Amount", "Shares", "Price", "Currency"]].copy()
+            display_df = display_df.rename(columns={
+                "Amount": "Invest ($)",
+                "Price": "Share Price",
+            })
+            st.dataframe(
+                display_df.style.format({
+                    "Composite Score": "{:.1f}",
+                    "Allocation %": "{:.1f}%",
+                    "Invest ($)": "${:,.2f}",
+                    "Share Price": "{:.2f}",
+                }).background_gradient(subset=["Composite Score"], cmap="RdYlGn", vmin=0, vmax=100),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Leftover cash
+            total_invested = (portfolio_df["Shares"] * portfolio_df["Price"]).sum()
+            leftover = budget - total_invested
+            st.write(f"**Total invested:** ${total_invested:,.2f}  |  "
+                     f"**Remaining cash:** ${leftover:,.2f}")
+
+            # Donut chart
+            st.subheader("Allocation Breakdown")
+            donut_df = portfolio_df[["Ticker", "Allocation %"]].copy()
+            donut = (
+                alt.Chart(donut_df)
+                .mark_arc(innerRadius=60)
+                .encode(
+                    theta=alt.Theta("Allocation %:Q"),
+                    color=alt.Color("Ticker:N", legend=alt.Legend(title="Stock")),
+                    tooltip=["Ticker", "Allocation %"],
+                )
+                .properties(height=350)
+            )
+            st.altair_chart(donut, use_container_width=True)
+
+    # ================================================================
+    # KEY METRICS
+    # ================================================================
+    st.header("Stock Metrics")
     metrics_rows = []
     for r in valid:
         metrics_rows.append({
             "Ticker": r["ticker"],
             "Name": r["name"],
             "Price": f"{r['price']:.2f} {r['currency']}",
-            "P/E": format_metric(r["P/E"]),
-            "Fwd P/E": format_metric(r["Fwd P/E"]),
-            "P/B": format_metric(r["P/B"]),
-            "ROE": format_metric(r["ROE"], pct=True),
-            "ROA": format_metric(r["ROA"], pct=True),
-            "D/E": format_metric(r["D/E"]),
-            "Div Yield": format_metric(r["Div Yield"], pct=True),
-            "Beta": format_metric(r["Beta"]),
-            "52w Chg": format_metric(r["52w Chg%"]) + ("%" if r["52w Chg%"] is not None else ""),
+            "P/E": fmt(r["P/E"]),
+            "Fwd P/E": fmt(r["Fwd P/E"]),
+            "P/B": fmt(r["P/B"]),
+            "ROE": fmt(r["ROE"], pct=True),
+            "ROA": fmt(r["ROA"], pct=True),
+            "D/E": fmt(r["D/E"]),
+            "Div Yield": fmt(r["Div Yield"], pct=True),
+            "Beta": fmt(r["Beta"]),
+            "52w Chg": fmt(r["52w Chg%"]) + ("%" if r["52w Chg%"] is not None else ""),
             "Sector": r["Sector"],
         })
     st.dataframe(pd.DataFrame(metrics_rows), use_container_width=True, hide_index=True)
 
-    # ---- Scores Table ----
-    st.subheader("Investor Strategy Scores (0-100)")
+    # ================================================================
+    # SCORE HEATMAP
+    # ================================================================
+    st.header("All Investor Scores")
     score_rows = []
     for r in valid:
         row = {"Ticker": r["ticker"]}
@@ -717,29 +763,14 @@ def main():
         hide_index=True,
     )
 
-    # ---- Explanations (expandable per stock) ----
-    st.subheader("Detailed Explanations")
-    for r in valid:
-        with st.expander(f"{r['ticker']} – {r['name']}"):
-            for inv in INVESTOR_NAMES:
-                s = r["scores"][inv]
-                e = r["explanations"][inv]
-                colour = "green" if s >= 60 else ("orange" if s >= 30 else "red")
-                st.markdown(f"**{inv}** — Score: :{colour}[**{s}**]")
-                st.caption(e)
-
-    # ---- Visualisation: grouped bar chart ----
-    st.subheader("Score Comparison Chart")
-
-    # Build long-form data for Altair
+    # ================================================================
+    # BAR CHART
+    # ================================================================
+    st.header("Score Comparison")
     chart_data = []
     for r in valid:
         for inv in INVESTOR_NAMES:
-            chart_data.append({
-                "Ticker": r["ticker"],
-                "Investor": inv,
-                "Score": r["scores"][inv],
-            })
+            chart_data.append({"Ticker": r["ticker"], "Investor": inv, "Score": r["scores"][inv]})
     chart_df = pd.DataFrame(chart_data)
 
     chart = (
@@ -748,7 +779,7 @@ def main():
         .encode(
             x=alt.X("Investor:N", sort=INVESTOR_NAMES, axis=alt.Axis(labelAngle=-45)),
             y=alt.Y("Score:Q", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Ticker:N"),
+            color="Ticker:N",
             xOffset="Ticker:N",
             tooltip=["Ticker", "Investor", "Score"],
         )
@@ -756,17 +787,22 @@ def main():
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # ---- Best Matches Summary ----
-    st.subheader("Best Matches")
-    st.markdown("Stocks scoring **60+** for each investor:")
-    for inv in INVESTOR_NAMES:
-        matches = [(r["ticker"], r["scores"][inv]) for r in valid if r["scores"][inv] >= 60]
-        if matches:
-            matches.sort(key=lambda x: x[1], reverse=True)
-            labels = ", ".join(f"{t} ({s})" for t, s in matches)
-            st.markdown(f"- **{inv}**: {labels}")
+    # ================================================================
+    # DETAILED EXPLANATIONS
+    # ================================================================
+    st.header("Detailed Explanations")
+    for r in valid:
+        with st.expander(f"{r['ticker']} — {r['name']}"):
+            for inv in INVESTOR_NAMES:
+                s = r["scores"][inv]
+                e = r["explanations"][inv]
+                clr = "green" if s >= 60 else ("orange" if s >= 30 else "red")
+                st.markdown(f"**{inv}** — Score: :{clr}[**{s}**]")
+                st.caption(e)
 
-    # ---- Disclaimer ----
+    # ================================================================
+    # DISCLAIMER
+    # ================================================================
     st.divider()
     st.caption(
         "**Disclaimer:** This application uses real financial data from Yahoo Finance "
